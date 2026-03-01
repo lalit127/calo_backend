@@ -9,12 +9,11 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 SUPABASE_URL      = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY      = os.getenv("SUPABASE_SERVICE_KEY", "")  # service_role key (backend only!)
+SUPABASE_KEY      = os.getenv("SUPABASE_SERVICE_KEY", "")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
 
 
 def _headers(token: str = None) -> dict:
-    """Headers for Supabase REST API"""
     key = token or SUPABASE_KEY
     return {
         "apikey":        SUPABASE_KEY,
@@ -29,10 +28,6 @@ class SupabaseService:
     # ── Auth: Verify Flutter's Supabase JWT ──────────────────────────────────
 
     async def verify_token(self, token: str) -> Optional[dict]:
-        """
-        Verify the Supabase access token sent from Flutter.
-        Returns user dict if valid, None if invalid.
-        """
         try:
             async with httpx.AsyncClient(timeout=10) as c:
                 r = await c.get(
@@ -44,6 +39,7 @@ class SupabaseService:
                 )
             if r.status_code == 200:
                 return r.json()
+            logger.warning(f"Token verify failed: {r.status_code} {r.text}")
             return None
         except Exception as e:
             logger.error(f"Token verification failed: {e}")
@@ -52,33 +48,129 @@ class SupabaseService:
     # ── User Profile ──────────────────────────────────────────────────────────
 
     async def get_user_profile(self, user_id: str) -> Optional[dict]:
+        """
+        Gets user profile. If row doesn't exist yet, creates it first.
+        This fixes the 404 error for brand-new users after OTP login.
+        """
         async with httpx.AsyncClient(timeout=10) as c:
             r = await c.get(
                 f"{SUPABASE_URL}/rest/v1/users",
                 headers=_headers(),
                 params={"id": f"eq.{user_id}", "select": "*"},
             )
+
         if r.status_code == 200:
             data = r.json()
-            return data[0] if data else None
-        return None
+            if data:
+                return data[0]
+
+        # ✅ Row doesn't exist — create a minimal profile so GET /users/me
+        # never returns 404 for a freshly signed-up user
+        logger.info(f"Profile not found for {user_id}, creating default row")
+        try:
+            created = await self._create_default_profile(user_id)
+            return created
+        except Exception as e:
+            logger.error(f"Failed to create default profile: {e}")
+            return None
+
+    async def _create_default_profile(self, user_id: str) -> dict:
+        """
+        Creates a minimal user row using the auth user's email from Supabase.
+        Called automatically when profile is missing.
+        """
+        # Fetch email from Supabase auth
+        email = ""
+        try:
+            async with httpx.AsyncClient(timeout=10) as c:
+                r = await c.get(
+                    f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}",
+                    headers={
+                        "apikey":        SUPABASE_KEY,
+                        "Authorization": f"Bearer {SUPABASE_KEY}",
+                    }
+                )
+            if r.status_code == 200:
+                email = r.json().get("email", "")
+        except Exception:
+            pass
+
+        payload = {
+            "id":             user_id,
+            "email":          email,
+            "name":           email.split("@")[0] if email else "",
+            "goal_calories":  2000,
+            "goal_protein":   150.0,
+            "goal_carbs":     250.0,
+            "goal_fat":       65.0,
+            "goal_water_ml":  2500,
+        }
+
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(
+                f"{SUPABASE_URL}/rest/v1/users",
+                headers={
+                    **_headers(),
+                    "Prefer": "resolution=merge-duplicates,return=representation",
+                },
+                json=payload,
+            )
+
+        if r.status_code in (200, 201):
+            data = r.json()
+            return data[0] if data else payload
+
+        logger.error(f"Create profile failed: {r.status_code} {r.text}")
+        return payload
 
     async def update_user_profile(self, user_id: str, updates: dict) -> dict:
+        """
+        Updates user profile. Uses upsert so it works even if the row
+        doesn't exist yet (e.g. called right after onboarding completes).
+        """
         updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+        # ✅ Use upsert (POST with merge-duplicates) instead of PATCH
+        # so this never fails with an empty response for new users
+        payload = {"id": user_id, **updates}
+
         async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.patch(
+            r = await c.post(
+                f"{SUPABASE_URL}/rest/v1/users",
+                headers={
+                    **_headers(),
+                    "Prefer": "resolution=merge-duplicates,return=representation",
+                },
+                json=payload,
+            )
+
+        if r.status_code in (200, 201):
+            data = r.json()
+            if data:
+                return data[0]
+
+        # Fallback: try regular PATCH
+        logger.warning(f"Upsert returned {r.status_code}, trying PATCH")
+        async with httpx.AsyncClient(timeout=10) as c:
+            r2 = await c.patch(
                 f"{SUPABASE_URL}/rest/v1/users",
                 headers=_headers(),
                 params={"id": f"eq.{user_id}"},
                 json=updates,
             )
-        r.raise_for_status()
-        data = r.json()
-        return data[0] if data else updates
+
+        if r2.status_code in (200, 204):
+            data = r2.json()
+            if data:
+                return data[0]
+            # 204 = success but no body — fetch the row
+            return await self.get_user_profile(user_id) or updates
+
+        r2.raise_for_status()
+        return updates
 
     async def upsert_user_profile(self, user_id: str, email: str,
                                    name: str = None) -> dict:
-        """Called after successful OTP login to ensure profile exists"""
         payload = {
             "id":    user_id,
             "email": email,
@@ -87,7 +179,10 @@ class SupabaseService:
         async with httpx.AsyncClient(timeout=10) as c:
             r = await c.post(
                 f"{SUPABASE_URL}/rest/v1/users",
-                headers={**_headers(), "Prefer": "resolution=merge-duplicates,return=representation"},
+                headers={
+                    **_headers(),
+                    "Prefer": "resolution=merge-duplicates,return=representation",
+                },
                 json=payload,
             )
         r.raise_for_status()
@@ -99,7 +194,6 @@ class SupabaseService:
     async def upload_food_image(self, image_bytes: bytes,
                                  user_id: str,
                                  mime_type: str) -> tuple[str, str]:
-        """Upload image to Supabase Storage, return (public_url, path)"""
         ext  = mime_type.split("/")[-1].replace("jpeg", "jpg")
         path = f"{user_id}/{uuid.uuid4()}.{ext}"
 
@@ -107,10 +201,10 @@ class SupabaseService:
             r = await c.post(
                 f"{SUPABASE_URL}/storage/v1/object/food-images/{path}",
                 headers={
-                    "apikey":          SUPABASE_KEY,
-                    "Authorization":   f"Bearer {SUPABASE_KEY}",
-                    "Content-Type":    mime_type,
-                    "x-upsert":        "true",
+                    "apikey":        SUPABASE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                    "Content-Type":  mime_type,
+                    "x-upsert":      "true",
                 },
                 content=image_bytes,
             )
@@ -155,46 +249,44 @@ class SupabaseService:
                 params={
                     "user_id":    f"eq.{user_id}",
                     "logged_at":  f"gte.{start}",
-                    "logged_at":  f"lt.{end}",
+                    "and":        f"(logged_at.lt.{end})",
                     "deleted_at": "is.null",
                     "select":     "*",
                     "order":      "logged_at.asc",
                 },
             )
 
-        entries = r.json() if r.status_code == 200 else []
+        entries  = r.json() if r.status_code == 200 else []
+        profile  = await self.get_user_profile(user_id) or {}
+        water    = await self.get_today_water(user_id)
 
-        # Group by meal type
         meals: dict = {"breakfast": [], "lunch": [], "dinner": [], "snack": []}
         for e in entries:
             mt = e.get("meal_type", "snack")
             if mt in meals:
                 meals[mt].append(e)
 
-        profile = await self.get_user_profile(user_id) or {}
-        water   = await self.get_today_water(user_id)
-
         return {
-            "date":            target.isoformat(),
-            "total_calories":  sum(e.get("calories", 0) for e in entries),
-            "total_protein":   round(sum(e.get("protein_g", 0) for e in entries), 1),
-            "total_carbs":     round(sum(e.get("carbs_g", 0) for e in entries), 1),
-            "total_fat":       round(sum(e.get("fat_g", 0) for e in entries), 1),
-            "total_fiber":     round(sum(e.get("fiber_g", 0) for e in entries), 1),
-            "total_water_ml":  water.get("total_ml", 0),
-            "goal_calories":   profile.get("goal_calories", 2000),
-            "goal_protein":    profile.get("goal_protein", 150),
-            "goal_carbs":      profile.get("goal_carbs", 250),
-            "goal_fat":        profile.get("goal_fat", 65),
-            "goal_water_ml":   profile.get("goal_water_ml", 2500),
-            "meals":           meals,
-            "entries":         entries,
+            "date":           target.isoformat(),
+            "total_calories": sum(e.get("calories", 0) for e in entries),
+            "total_protein":  round(sum(e.get("protein_g", 0) for e in entries), 1),
+            "total_carbs":    round(sum(e.get("carbs_g", 0) for e in entries), 1),
+            "total_fat":      round(sum(e.get("fat_g", 0) for e in entries), 1),
+            "total_fiber":    round(sum(e.get("fiber_g", 0) for e in entries), 1),
+            "total_water_ml": water.get("total_ml", 0),
+            "goal_calories":  profile.get("goal_calories", 2000),
+            "goal_protein":   profile.get("goal_protein", 150),
+            "goal_carbs":     profile.get("goal_carbs", 250),
+            "goal_fat":       profile.get("goal_fat", 65),
+            "goal_water_ml":  profile.get("goal_water_ml", 2500),
+            "meals":          meals,
+            "entries":        entries,
         }
 
     async def get_weekly_stats(self, user_id: str) -> dict:
-        today  = date.today()
-        start  = datetime(today.year, today.month, today.day,
-                          tzinfo=timezone.utc) - timedelta(days=6)
+        today = date.today()
+        start = datetime(today.year, today.month, today.day,
+                         tzinfo=timezone.utc) - timedelta(days=6)
 
         async with httpx.AsyncClient(timeout=10) as c:
             r = await c.get(
@@ -208,11 +300,10 @@ class SupabaseService:
                 },
             )
 
-        logs   = r.json() if r.status_code == 200 else []
+        logs    = r.json() if r.status_code == 200 else []
         profile = await self.get_user_profile(user_id) or {}
         goal_cal = profile.get("goal_calories", 2000)
 
-        # Build daily buckets
         days_data = []
         for i in range(6, -1, -1):
             d = today - timedelta(days=i)
@@ -232,11 +323,11 @@ class SupabaseService:
         calories_list = [d["calories"] for d in days_data if d["calories"] > 0]
 
         return {
-            "days":          days_data,
-            "avg_calories":  round(sum(calories_list) / len(calories_list), 1) if calories_list else 0,
-            "avg_protein":   round(sum(d["protein"] for d in days_data) / 7, 1),
+            "days":           days_data,
+            "avg_calories":   round(sum(calories_list) / len(calories_list), 1) if calories_list else 0,
+            "avg_protein":    round(sum(d["protein"] for d in days_data) / 7, 1),
             "total_calories": sum(d["calories"] for d in days_data),
-            "streak":        self._calc_streak(days_data),
+            "streak":         self._calc_streak(days_data),
         }
 
     async def get_food_history(self, user_id: str,
@@ -273,7 +364,11 @@ class SupabaseService:
             r = await c.post(
                 f"{SUPABASE_URL}/rest/v1/water_logs",
                 headers=_headers(),
-                json={"user_id": user_id, "amount_ml": amount_ml},
+                json={
+                    "user_id":   user_id,
+                    "amount_ml": amount_ml,
+                    "logged_at": datetime.now(timezone.utc).isoformat(),
+                },
             )
         r.raise_for_status()
         return r.json()[0] if r.json() else {}
@@ -297,8 +392,8 @@ class SupabaseService:
         logs  = r.json() if r.status_code == 200 else []
         total = sum(l.get("amount_ml", 0) for l in logs)
 
-        profile  = await self.get_user_profile(user_id) or {}
-        goal     = profile.get("goal_water_ml", 2500)
+        profile = await self.get_user_profile(user_id) or {}
+        goal    = profile.get("goal_water_ml", 2500)
 
         return {
             "total_ml":   total,
@@ -315,9 +410,13 @@ class SupabaseService:
             r = await c.post(
                 f"{SUPABASE_URL}/rest/v1/weight_logs",
                 headers=_headers(),
-                json={"user_id": user_id, "weight_kg": weight_kg, "note": note},
+                json={
+                    "user_id":    user_id,
+                    "weight_kg":  weight_kg,
+                    "note":       note,
+                    "logged_at":  datetime.now(timezone.utc).isoformat(),
+                },
             )
-        # Also update current weight on profile
         await self.update_user_profile(user_id, {"weight_kg": weight_kg})
         r.raise_for_status()
         return r.json()[0] if r.json() else {}
