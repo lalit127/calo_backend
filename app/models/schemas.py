@@ -1,5 +1,5 @@
 # backend/app/models/schemas.py
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 from typing import Optional, List, Any
 from datetime import datetime
 
@@ -20,6 +20,8 @@ class AnalysisResult(BaseModel):
     ingredients_detected: List[str] = []
     cooking_method: Optional[str] = None
     confidence: float = 0.9
+    from_cache: bool = False        # ✅ added — cache hit flag from mistral_service
+    serving_grams: Optional[int] = None  # ✅ added — returned by mistral_service
 
 
 class AnalyzeTextRequest(BaseModel):
